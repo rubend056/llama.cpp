@@ -45,6 +45,7 @@ if (NOT ZENDNN_ROOT OR ZENDNN_ROOT STREQUAL "" OR ZENDNN_ROOT STREQUAL "OFF")
             -DZENDNNL_DEPENDS_AOCLDLP=ON
             -DZENDNNL_DEPENDS_ONEDNN=ON
             -DZENDNNL_DEPENDS_LIBXSMM=ON
+        PATCH_COMMAND   sed -i "s/-Werror//g" <SOURCE_DIR>/zendnnl/CMakeLists.txt
         BUILD_COMMAND   ${CMAKE_COMMAND} --build ${ZENDNN_BUILD_DIR} --target zendnnl
         INSTALL_COMMAND ${CMAKE_COMMAND} --build ${ZENDNN_BUILD_DIR} --target install
         BUILD_ALWAYS OFF
