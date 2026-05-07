@@ -406,7 +406,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
     }
-    if (arch == LLM_ARCH_QWEN35_MTP || arch == LLM_ARCH_QWEN35MOE_MTP) {
+    if (arch == LLM_ARCH_QWEN35_MTP || arch == LLM_ARCH_QWEN35MOE_MTP || arch == LLM_ARCH_GLM_DSA_MTP) {
         return false; // MTP-only arch; requires a sibling trunk model and cannot run standalone.
     }
 

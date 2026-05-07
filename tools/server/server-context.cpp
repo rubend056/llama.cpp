@@ -12,6 +12,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "fit.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -714,13 +715,18 @@ private:
     bool sleeping = false;
 
     void destroy() {
-        llama_init.reset();
-
+        // Tear down per-slot state BEFORE the trunk context is freed. Slots may
+        // hold speculative-state objects (e.g. MTP) whose destructors call back
+        // into ctx_tgt (llama_set_mtp(ctx_tgt, nullptr)) to detach hooks; doing
+        // it after llama_init.reset() is a use-after-free that manifests as
+        // "double free or corruption" during shutdown.
         for (server_slot & slot : slots) {
             if (slot.can_speculate()) {
                 slot.spec.reset();
             }
         }
+
+        llama_init.reset();
 
         ctx = nullptr;
         model = nullptr;
@@ -765,6 +771,130 @@ private:
 
         params_base = params;
 
+        // ----- MTP head pre-load (before trunk) -----
+        // Loading the MTP head before the trunk means it grabs its slice of VRAM first; the trunk's
+        // -fitt fit pass then sees correctly-reduced free VRAM and budgets accordingly. Otherwise
+        // the trunk eats 100% of the VRAM target and the MTP load OOMs.
+        std::string mtp_arch_name;
+        llama_model_params mparams_mtp_pending = {};
+        bool have_mtp_pending = false;
+        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+            // peek at the trunk arch directly from the gguf (file is on disk, no load yet)
+            std::string trunk_arch;
+            {
+                ggml_context * meta_ctx = nullptr;
+                gguf_init_params gip = { /*.no_alloc=*/ true, /*.ctx=*/ &meta_ctx };
+                gguf_context * gguf = gguf_init_from_file(params_base.model.path.c_str(), gip);
+                if (gguf) {
+                    const int kid = gguf_find_key(gguf, "general.architecture");
+                    if (kid >= 0) {
+                        trunk_arch = gguf_get_val_str(gguf, kid);
+                    }
+                    gguf_free(gguf);
+                }
+                if (meta_ctx) {
+                    ggml_free(meta_ctx);
+                }
+            }
+
+            const char * mtp_arch = nullptr;
+            if (trunk_arch == "qwen35moe") {
+                mtp_arch = "qwen35moe_mtp";
+            } else if (trunk_arch == "qwen35") {
+                mtp_arch = "qwen35_mtp";
+            } else if (trunk_arch == "glm-dsa") {
+                mtp_arch = "glm-dsa_mtp";
+            } else {
+                SRV_ERR("MTP not supported for trunk architecture '%s'\n", trunk_arch.c_str());
+                return false;
+            }
+            mtp_arch_name = mtp_arch;
+
+            SRV_INF("pre-loading MTP head from '%s' (override_arch=%s) before trunk\n",
+                    params_base.model.path.c_str(), mtp_arch);
+
+            mparams_mtp_pending = common_model_params_to_llama(params_base);
+            mparams_mtp_pending.override_arch = mtp_arch_name.c_str();
+
+            llama_context_params cparams_mtp = common_context_params_to_llama(params_base);
+            cparams_mtp.n_seq_max = 1;
+            cparams_mtp.n_rs_seq  = 0;
+
+            // MTP receives one hook-decode per trunk ubatch, with up to `trunk.n_ubatch`
+            // rows in a single llama_batch (see llama_context::handle_mtp_for_ubatch).
+            // Therefore MTP's n_batch must be >= trunk.n_ubatch or llama_decode will
+            // GGML_ASSERT(n_tokens_all <= cparams.n_batch). MTP's n_ubatch governs the
+            // compute-buffer footprint; 256 keeps that footprint bounded (~hundreds of
+            // MiB for GLM-DSA) while still letting prompt-prefill hook batches make
+            // useful progress per graph dispatch — slicing 2048 rows into 8 ubatches
+            // of 256 instead of 256 ubatches of 8.
+            const uint32_t trunk_n_ubatch = cparams_mtp.n_ubatch ? cparams_mtp.n_ubatch : 512;
+            cparams_mtp.n_batch  = trunk_n_ubatch;
+            cparams_mtp.n_ubatch = std::min<uint32_t>(256, trunk_n_ubatch);
+
+            // run the same -fitt fitting pass on the MTP head so we don't blow past device-memory
+            // budgets when CUDA mallocs the MTP weights/KV.
+            if (params_base.fit_params) {
+                std::vector<float>                            ts_mtp(params_base.tensor_split,
+                                                                     params_base.tensor_split + llama_max_devices());
+                std::vector<llama_model_tensor_buft_override> tbo_mtp = params_base.tensor_buft_overrides;
+                if (tbo_mtp.empty() || tbo_mtp.back().pattern != nullptr) {
+                    tbo_mtp.push_back({nullptr, nullptr});
+                }
+                std::vector<size_t> targets_mtp = params_base.fit_params_target;
+
+                SRV_INF("%s\n", "fitting MTP head params to device memory");
+                const auto rc = common_fit_params(params_base.model.path.c_str(),
+                                                  &mparams_mtp_pending,
+                                                  &cparams_mtp,
+                                                  ts_mtp.data(),
+                                                  tbo_mtp.data(),
+                                                  targets_mtp.data(),
+                                                  params_base.fit_params_min_ctx,
+                                                  params_base.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                if (rc != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                    SRV_WRN("%s\n", "could not fit MTP head to free device memory; falling back to user params");
+                }
+            }
+
+            model_mtp.reset(llama_model_load_from_file(params_base.model.path.c_str(), mparams_mtp_pending));
+            if (model_mtp == nullptr) {
+                SRV_ERR("failed to load MTP head from '%s'\n", params_base.model.path.c_str());
+                return false;
+            }
+
+            // stash the cparams; we'll fix n_ctx after the trunk context is built
+            params_base.speculative.mtp.model   = model_mtp.get();
+            params_base.speculative.mtp.cparams = cparams_mtp;
+            have_mtp_pending = true;
+
+            // Bump the trunk's per-device free-memory target to leave headroom for
+            // (a) the MTP's runtime KV cache + compute buffer (built later) and
+            // (b) ~700 MiB of CUDA driver / sched overhead that the fit pass cannot see.
+            // Without this bump the trunk fit packs CUDA1 to within ~1 GiB of full and the
+            // post-runtime free margin shrinks below the user-requested -fitt floor.
+            if (params_base.fit_params) {
+                constexpr size_t mtp_runtime_pad = 1024ull * 1024ull * 1024ull; // 1 GiB
+                for (size_t i = 0; i < params_base.fit_params_target.size(); ++i) {
+                    params_base.fit_params_target[i] += mtp_runtime_pad;
+                }
+                SRV_INF("%s\n", "trunk fit targets bumped by 1024 MiB/device to keep MTP runtime headroom");
+            }
+
+            if (params_base.n_parallel > 1) {
+                SRV_ERR("MTP currently supports only n_parallel=1; got %d\n", params_base.n_parallel);
+                return false;
+            }
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported with MTP, it will be disabled");
+            }
+            if (params_base.ctx_shift) {
+                params_base.ctx_shift = false;
+                SRV_WRN("%s\n", "ctx_shift is not supported with MTP, it will be disabled");
+            }
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model = llama_init->model();
@@ -773,6 +903,11 @@ private:
         if (model == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        if (have_mtp_pending) {
+            // align MTP context size to the trunk's resolved n_ctx_seq
+            params_base.speculative.mtp.cparams.n_ctx = llama_n_ctx_seq(ctx);
         }
 
         vocab = llama_model_get_vocab(model);
@@ -816,56 +951,6 @@ private:
             params_base.speculative.draft.model = model_dft.get();
             params_base.speculative.draft.cparams = common_context_params_to_llama(params_dft);
             params_base.speculative.draft.cparams.n_rs_seq = 0;
-        }
-
-        //TODO: generalize if this is ok, we should load <arch_name>_mtp arch?
-        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
-            char trunk_arch[64] = {0};
-            llama_model_meta_val_str(model, "general.architecture", trunk_arch, sizeof(trunk_arch));
-
-            const char * mtp_arch = nullptr;
-            if (std::string(trunk_arch) == "qwen35moe") {
-                mtp_arch = "qwen35moe_mtp";
-            } else if (std::string(trunk_arch) == "qwen35") {
-                mtp_arch = "qwen35_mtp";
-            } else {
-                SRV_ERR("MTP not supported for trunk architecture '%s'\n", trunk_arch);
-                return false;
-            }
-
-            SRV_INF("loading MTP head from '%s' (override_arch=%s)\n",
-                    params_base.model.path.c_str(), mtp_arch);
-
-            auto mparams_mtp = common_model_params_to_llama(params_base);
-            mparams_mtp.override_arch = mtp_arch;
-
-            model_mtp.reset(llama_model_load_from_file(params_base.model.path.c_str(), mparams_mtp));
-            if (model_mtp == nullptr) {
-                SRV_ERR("failed to load MTP head from '%s'\n", params_base.model.path.c_str());
-                return false;
-            }
-
-            if (params_base.n_parallel > 1) {
-                SRV_ERR("MTP currently supports only n_parallel=1; got %d\n", params_base.n_parallel);
-                return false;
-            }
-
-            auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx);
-            cparams_mtp.n_seq_max = 1;
-            cparams_mtp.n_rs_seq = 0;
-
-            params_base.speculative.mtp.model   = model_mtp.get();
-            params_base.speculative.mtp.cparams = cparams_mtp;
-
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported with MTP, it will be disabled");
-            }
-            if (params_base.ctx_shift) {
-                params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported with MTP, it will be disabled");
-            }
         }
 
         std::string & mmproj_path = params_base.mmproj.path;

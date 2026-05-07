@@ -3379,24 +3379,35 @@ void llama_context::set_mtp(llama_context * ctx_mtp_in) {
         mtp.hook_batch = llama_batch{};
     }
 
-    mtp.ctx_mtp     = ctx_mtp_in;
-    mtp.pending_pos = -1;
+    mtp.ctx_mtp = ctx_mtp_in;
+    mtp.h_ring.clear();
 
     if (mtp.ctx_mtp) {
         const int32_t n_ub   = (int32_t) cparams.n_ubatch;
         const int32_t n_embd = (int32_t) model.hparams.n_embd;
         mtp.hook_batch       = llama_batch_init(n_ub, n_embd, 1);
         mtp.hook_batch.token = (llama_token *) malloc(sizeof(llama_token) * n_ub);
-        mtp.pending_h.assign(n_embd, 0.0f);
         LLAMA_LOG_INFO("%s: MTP draft head registered (ctx_mtp=%p, n_ubatch=%d, n_embd=%d)\n",
                        __func__, (const void *) mtp.ctx_mtp, n_ub, n_embd);
     } else {
-        mtp.pending_h.clear();
-        mtp.pending_h.shrink_to_fit();
         LLAMA_LOG_INFO("%s: MTP draft head unregistered\n", __func__);
     }
 }
 
+// Streaming MTP-cache populator.
+//
+// Every trunk ubatch contributes its hidden-state rows to a sliding ring
+// buffer (size = n_ubatch). If the MTP cache has positions >= pos_start
+// (from a preceding draft AR loop), those tail entries are trimmed. Then
+// we look up h_{pos_start-1} in the ring:
+//
+//   Found  → full write: n_rows rows  starting at pos_start.
+//   Missing → partial write: n_rows-1 rows starting at pos_start+1.
+//
+// This eliminates the three-way state machine (AHEAD/IN-SYNC/DRIFT) and
+// the single-float-vector stash that went stale across checkpoint-restore
+// cycles. The ring is self-cleaning (old entries fall off as new ones are
+// added), so no per-call patchwork is needed in llama_context_seq_rm.
 void llama_context::handle_mtp_for_ubatch(
         int32_t                n_tokens,
         const llama_token    * tokens,
@@ -3414,26 +3425,76 @@ void llama_context::handle_mtp_for_ubatch(
     const int       n_rows    = (int) n_tokens;
     const llama_pos pos_start = positions[0];
 
-    const llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(mtp.ctx_mtp), 0);
-    if (pos_start <= pos_max_mtp) {
-        return;
-    }
-
-    const bool pending_continues = mtp.pending_pos >= 0 && mtp.pending_pos + 1 == pos_start;
-    if (mtp.pending_pos >= 0 && !pending_continues) {
-        mtp.pending_pos = -1;
-    }
-
     synchronize();
 
     const size_t row_bytes = (size_t) n_embd * sizeof(float);
-    const int    n_out     = (pending_continues ? 1 : 0) + (n_rows - 1);
+
+    // ---- Step 1: buffer current trunk hidden states into the ring ----
+    {
+        const size_t ring_max = (size_t) cparams.n_ubatch;
+        for (int k = 0; k < n_rows; ++k) {
+            while (mtp.h_ring.size() >= ring_max) {
+                mtp.h_ring.pop_front();
+            }
+            llama_mtp::h_entry e;
+            e.pos = positions[k];
+            e.h.resize((size_t) n_embd);
+            ggml_backend_tensor_get(t, e.h.data(), (size_t) k * row_bytes, row_bytes);
+            mtp.h_ring.push_back(std::move(e));
+        }
+    }
+
+    // ---- Step 2: inspect MTP cache state ----
+    llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(mtp.ctx_mtp), 0);
+    const llama_pos need_pos = pos_start - 1;
+
+    // ---- Step 3: reconcile MTP cache with the trunk timeline ----
+    if (pos_max_mtp >= pos_start) {
+        // MTP draft pre-populated this range. Truncate to pos_start-1
+        // so the upcoming write is contiguous.
+        llama_memory_seq_rm(llama_get_memory(mtp.ctx_mtp), 0, pos_start, -1);
+        pos_max_mtp = need_pos;
+    }
+
+    if (pos_max_mtp >= 0 && pos_max_mtp != need_pos) {
+        // Gap: MTP cache ends somewhere other than need_pos.
+        // Wipe and fall through to partial write.
+        llama_memory_seq_rm(llama_get_memory(mtp.ctx_mtp), 0, -1, -1);
+        LLAMA_LOG_WARN("%s: MTP cache wiped (pos_max_mtp=%d, pos_start=%d); "
+                       "drafts will degrade until cache repopulates\n",
+                       __func__, (int) pos_max_mtp, (int) pos_start);
+        pos_max_mtp = -1;
+    }
+
+    // ---- Step 4: find h_{need_pos} in the ring ----
+    const float * h_prev = nullptr;
+    if (pos_max_mtp == need_pos) {
+        for (auto it = mtp.h_ring.rbegin(); it != mtp.h_ring.rend(); ++it) {
+            if (it->pos == need_pos) {
+                h_prev = it->h.data();
+                break;
+            }
+        }
+        if (!h_prev) {
+            // Ring doesn't have the needed h-row — it fell out or is from
+            // a stale sequence. Wipe MTP cache and recover via partial write.
+            llama_memory_seq_rm(llama_get_memory(mtp.ctx_mtp), 0, -1, -1);
+            LLAMA_LOG_WARN("%s: MTP cache wiped — h_{%d} not in ring; "
+                           "drafts will degrade until cache repopulates\n",
+                           __func__, (int) need_pos);
+            pos_max_mtp = -1;
+        }
+    }
+
+    // ---- Step 5: write hook batch ----
+    const bool have_prev_h = (h_prev != nullptr);
+    const int  n_out       = (have_prev_h ? 1 : 0) + (n_rows - 1);
 
     if (n_out > 0) {
         int out_idx = 0;
-        if (pending_continues) {
+        if (have_prev_h) {
             std::memcpy(mtp.hook_batch.embd + (size_t) out_idx * n_embd,
-                        mtp.pending_h.data(), row_bytes);
+                        h_prev, row_bytes);
             mtp.hook_batch.token[out_idx]     = tokens[0];
             mtp.hook_batch.pos[out_idx]       = pos_start;
             mtp.hook_batch.n_seq_id[out_idx]  = 1;
@@ -3458,16 +3519,14 @@ void llama_context::handle_mtp_for_ubatch(
 
         const int32_t rc_dec = llama_decode(mtp.ctx_mtp, mtp.hook_batch);
         if (rc_dec != 0) {
+            // Decode failure leaves MTP cache in unknown state.
+            // Clear the ring so the next call starts from scratch.
             LLAMA_LOG_ERROR("%s: llama_decode(ctx_mtp) failed rc=%d (pos=%d, n=%d)\n",
                             __func__, (int) rc_dec, (int) pos_start, n_out);
+            mtp.h_ring.clear();
+            return;
         }
     }
-
-    // Stash the last h-row as the new pending (for the next ubatch's first
-    // token to pair with).
-    ggml_backend_tensor_get(t, mtp.pending_h.data(),
-        (size_t) (n_rows - 1) * row_bytes, row_bytes);
-    mtp.pending_pos = pos_start + n_rows - 1;
 }
 
 void llama_synchronize(llama_context * ctx) {
@@ -3638,6 +3697,9 @@ bool llama_context_seq_rm(
     const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, p1);
 
     if (llama_context * ctx_mtp = ctx->get_mtp()) {
+        // Mirror the trim onto the MTP cache. The next handle_mtp_for_ubatch
+        // will reconcile any drift automatically via its ring-buffer lookup
+        // — no per-call fixup required here.
         llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1);
     }
     return ok;

@@ -423,6 +423,11 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
     }
     cur = inpL;
 
+    if (hparams.nextn_predict_layers > 0) {
+        cb(cur, "h_pre_norm", -1);
+        res->t_h_pre_norm = cur;
+    }
+
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
