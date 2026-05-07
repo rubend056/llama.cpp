@@ -9,6 +9,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -840,7 +841,7 @@ private:
             // of 256 instead of 256 ubatches of 8.
             const uint32_t trunk_n_ubatch = cparams_mtp.n_ubatch ? cparams_mtp.n_ubatch : 512;
             cparams_mtp.n_batch  = trunk_n_ubatch;
-            cparams_mtp.n_ubatch = std::min<uint32_t>(256, trunk_n_ubatch);
+            cparams_mtp.n_ubatch = std::min<uint32_t>(512, trunk_n_ubatch);
 
             // run the same -fitt fitting pass on the MTP head so we don't blow past device-memory
             // budgets when CUDA mallocs the MTP weights/KV.
@@ -878,17 +879,61 @@ private:
             params_base.speculative.mtp.cparams = cparams_mtp;
             have_mtp_pending = true;
 
-            // Bump the trunk's per-device free-memory target to leave headroom for
-            // (a) the MTP's runtime KV cache + compute buffer (built later) and
-            // (b) ~700 MiB of CUDA driver / sched overhead that the fit pass cannot see.
-            // Without this bump the trunk fit packs CUDA1 to within ~1 GiB of full and the
-            // post-runtime free margin shrinks below the user-requested -fitt floor.
+            // Measure MTP runtime memory (context + compute) per device so the trunk
+            // fit can reserve exact per-device headroom.  The model weights are
+            // already on GPU and reflected in the driver free-memory report — only
+            // the yet-to-be-created context allocations (KV cache, compute buffer)
+            // need to be added to the fit target.
+            //
+            // We also measure the persistent CUDA driver / NCCL overhead (the gap
+            // between what the driver reports as used and what the breakdown API
+            // accounts for) and add that to the target — otherwise it silently
+            // eats into the user-requested -fitt margin.
             if (params_base.fit_params) {
-                constexpr size_t mtp_runtime_pad = 1024ull * 1024ull * 1024ull; // 1 GiB
-                for (size_t i = 0; i < params_base.fit_params_target.size(); ++i) {
-                    params_base.fit_params_target[i] += mtp_runtime_pad;
+                std::vector<size_t> mtp_runtime_per_device(llama_max_devices(), 0);
+                {
+                    llama_context * measure_ctx = llama_init_from_model(model_mtp.get(), cparams_mtp);
+                    if (measure_ctx) {
+                        const auto mb = llama_get_memory_breakdown(measure_ctx);
+                        for (const auto & [buft, md] : mb) {
+                            if (ggml_backend_buft_is_host(buft)) {
+                                continue;
+                            }
+                            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                            if (!dev) {
+                                continue;
+                            }
+                            for (int i = 0; i < llama_model_n_devices(model_mtp.get()); i++) {
+                                if (dev == llama_model_get_device(model_mtp.get(), i)) {
+                                    // Add context+compute for the yet-to-be-created
+                                    // MTP context.  Also capture the persistent
+                                    // driver overhead (total - driver_free -
+                                    // measured_self) so the trunk fit leaves
+                                    // room for it.
+                                    mtp_runtime_per_device[i] += md.context + md.compute;
+                                    {
+                                        size_t dfree = 0, dtotal = 0;
+                                        ggml_backend_dev_memory(dev, &dfree, &dtotal);
+                                        const int64_t dev_overhead = (int64_t)dtotal
+                                            - (int64_t)dfree
+                                            - (int64_t)(md.model + md.context + md.compute);
+                                        if (dev_overhead > 0) {
+                                            mtp_runtime_per_device[i] += (size_t)dev_overhead;
+                                        }
+                                        SRV_INF("  MTP device %d driver overhead: %" PRId64 " MiB\n",
+                                                i, dev_overhead / (1024*1024));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        llama_free(measure_ctx);
+                    }
                 }
-                SRV_INF("%s\n", "trunk fit targets bumped by 1024 MiB/device to keep MTP runtime headroom");
+                for (size_t i = 0; i < params_base.fit_params_target.size() && i < mtp_runtime_per_device.size(); ++i) {
+                    params_base.fit_params_target[i] += mtp_runtime_per_device[i];
+                }
+                SRV_INF("%s\n", "trunk fit targets bumped by measured MTP runtime + driver overhead per device");
             }
 
             if (params_base.n_parallel > 1) {
