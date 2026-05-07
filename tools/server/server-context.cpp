@@ -519,6 +519,16 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec.get());
+
+        // log MTP hook timing if applicable
+        if (is_mtp()) {
+            llama_mtp_timing_log(ctx);
+            llama_mtp_timing_reset(ctx);
+        }
+
+        // log trunk decode timing
+        llama_trunk_timing_log(ctx);
+        llama_trunk_timing_reset(ctx);
     }
 
     json to_json(bool only_metrics = false) const {

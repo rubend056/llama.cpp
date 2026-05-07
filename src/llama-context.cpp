@@ -1597,6 +1597,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    const int64_t t_decode_start = ggml_time_us();
+    int64_t       t_compute_acc  = 0;
+    int32_t       n_ubatches_acc = 0;
+    int32_t       n_ub_tokens_acc = 0;
+
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -1706,8 +1711,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        const int64_t t_comp_start = ggml_time_us();
+
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+
+        t_compute_acc    += (ggml_time_us() - t_comp_start);
+        n_ubatches_acc   += 1;
+        n_ub_tokens_acc  += ubatch.n_tokens;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1895,6 +1906,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (mtp.ctx_mtp) {
+        const int64_t t_total = ggml_time_us() - t_decode_start;
+        const bool    is_pp   = batch_inp.n_tokens >= 8;
+        if (is_pp) {
+            trunk_timing.t_pp_total_us   += t_total;
+            trunk_timing.t_pp_compute_us += t_compute_acc;
+            trunk_timing.n_pp_calls      += 1;
+            trunk_timing.n_pp_tokens     += n_tokens_all;
+            trunk_timing.n_pp_ubatches   += n_ubatches_acc;
+            trunk_timing.n_pp_tokens_ub  += n_ub_tokens_acc;
+        } else {
+            trunk_timing.t_gen_total_us   += t_total;
+            trunk_timing.t_gen_compute_us += t_compute_acc;
+            trunk_timing.n_gen_calls      += 1;
+            trunk_timing.n_gen_tokens     += n_tokens_all;
+            trunk_timing.n_gen_ubatches   += n_ubatches_acc;
+            trunk_timing.n_gen_tokens_ub  += n_ub_tokens_acc;
+        }
+    }
 
     return 0;
 }
@@ -3371,6 +3402,82 @@ void llama_set_mtp(struct llama_context * ctx_target, struct llama_context * ctx
     ctx_target->set_mtp(ctx_mtp);
 }
 
+void llama_mtp_timing_log(struct llama_context * ctx) {
+    if (!ctx || !ctx->get_mtp()) return;
+    const auto & t = ctx->get_mtp_hook_timing();
+    if (t.n_calls == 0) return;
+    LLAMA_LOG_INFO("--- MTP hook timing ---\n");
+    LLAMA_LOG_INFO("  calls:        %d\n", t.n_calls);
+    LLAMA_LOG_INFO("  rows_copied:  %d (ring copies)\n", t.n_rows_copied);
+    LLAMA_LOG_INFO("  rows_decoded: %d (hook decode)\n", t.n_rows_decoded);
+    LLAMA_LOG_INFO("  ring_hits:    %d\n", t.n_ring_hits);
+    LLAMA_LOG_INFO("  ring_misses:  %d\n", t.n_ring_misses);
+    LLAMA_LOG_INFO("  cache_wipes:  %d\n", t.n_cache_wipes);
+    LLAMA_LOG_INFO("  total:        %.2f ms (avg %.3f ms/call)\n",
+                   t.t_total_us / 1000.0, t.t_total_us / 1000.0 / t.n_calls);
+    LLAMA_LOG_INFO("    sync:       %.2f ms (%.1f%%)\n",
+                   t.t_sync_us / 1000.0, 100.0 * t.t_sync_us / std::max<int64_t>(1, t.t_total_us));
+    LLAMA_LOG_INFO("    copy_ring:  %.2f ms (%.1f%%)\n",
+                   t.t_copy_ring_us / 1000.0, 100.0 * t.t_copy_ring_us / std::max<int64_t>(1, t.t_total_us));
+    LLAMA_LOG_INFO("    reconcile:  %.2f ms (%.1f%%)\n",
+                   t.t_reconcile_us / 1000.0, 100.0 * t.t_reconcile_us / std::max<int64_t>(1, t.t_total_us));
+    LLAMA_LOG_INFO("    lookup:     %.2f ms (%.1f%%)\n",
+                   t.t_lookup_us / 1000.0, 100.0 * t.t_lookup_us / std::max<int64_t>(1, t.t_total_us));
+    LLAMA_LOG_INFO("    build_batch:%.2f ms (%.1f%%)\n",
+                   t.t_build_batch_us / 1000.0, 100.0 * t.t_build_batch_us / std::max<int64_t>(1, t.t_total_us));
+    LLAMA_LOG_INFO("    decode:     %.2f ms (%.1f%%)\n",
+                   t.t_decode_us / 1000.0, 100.0 * t.t_decode_us / std::max<int64_t>(1, t.t_total_us));
+}
+
+void llama_mtp_timing_reset(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->reset_mtp_timing();
+}
+
+void llama_trunk_timing_log(struct llama_context * ctx) {
+    if (!ctx) return;
+    const auto & t = ctx->get_trunk_timing();
+    if (t.n_pp_calls == 0 && t.n_gen_calls == 0) return;
+
+    const int64_t t_pp_overhead  = t.t_pp_total_us  - t.t_pp_compute_us;
+    const int64_t t_gen_overhead = t.t_gen_total_us - t.t_gen_compute_us;
+
+    LLAMA_LOG_INFO("--- Trunk decode timing ---\n");
+    if (t.n_pp_calls > 0) {
+        LLAMA_LOG_INFO("  PP (prompt processing):\n");
+        LLAMA_LOG_INFO("    calls:  %d, tokens: %d, ubatches: %d (tokens: %d in ubatches)\n",
+                       t.n_pp_calls, t.n_pp_tokens, t.n_pp_ubatches, t.n_pp_tokens_ub);
+        LLAMA_LOG_INFO("    total:  %.2f ms (avg %.3f ms/call, %.3f ms/tok)\n",
+                       t.t_pp_total_us / 1000.0,
+                       t.t_pp_total_us / 1000.0 / t.n_pp_calls,
+                       t.t_pp_total_us / 1000.0 / std::max(1, t.n_pp_tokens));
+        LLAMA_LOG_INFO("    compute:%.2f ms (%.1f%%), overhead: %.2f ms (%.1f%%)\n",
+                       t.t_pp_compute_us / 1000.0,
+                       100.0 * t.t_pp_compute_us / std::max<int64_t>(1, t.t_pp_total_us),
+                       t_pp_overhead / 1000.0,
+                       100.0 * t_pp_overhead / std::max<int64_t>(1, t.t_pp_total_us));
+    }
+    if (t.n_gen_calls > 0) {
+        LLAMA_LOG_INFO("  GEN (generation/verification):\n");
+        LLAMA_LOG_INFO("    calls:  %d, tokens: %d, ubatches: %d (tokens: %d in ubatches)\n",
+                       t.n_gen_calls, t.n_gen_tokens, t.n_gen_ubatches, t.n_gen_tokens_ub);
+        LLAMA_LOG_INFO("    total:  %.2f ms (avg %.3f ms/call, %.3f ms/tok)\n",
+                       t.t_gen_total_us / 1000.0,
+                       t.t_gen_total_us / 1000.0 / t.n_gen_calls,
+                       t.t_gen_total_us / 1000.0 / std::max(1, t.n_gen_tokens));
+        LLAMA_LOG_INFO("    compute:%.2f ms (%.1f%%), overhead: %.2f ms (%.1f%%)\n",
+                       t.t_gen_compute_us / 1000.0,
+                       100.0 * t.t_gen_compute_us / std::max<int64_t>(1, t.t_gen_total_us),
+                       t_gen_overhead / 1000.0,
+                       100.0 * t_gen_overhead / std::max<int64_t>(1, t.t_gen_total_us));
+    }
+}
+
+void llama_trunk_timing_reset(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->reset_trunk_timing();
+}
+
 void llama_context::set_mtp(llama_context * ctx_mtp_in) {
     if (mtp.ctx_mtp == ctx_mtp_in) return;
 
@@ -3425,13 +3532,17 @@ void llama_context::handle_mtp_for_ubatch(
     const int       n_rows    = (int) n_tokens;
     const llama_pos pos_start = positions[0];
 
+    const int64_t t_start = ggml_time_us();
+
     synchronize();
+
+    const int64_t t_after_sync = ggml_time_us();
 
     const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
     // ---- Step 1: buffer current trunk hidden states into the ring ----
     {
-        const size_t ring_max = (size_t) cparams.n_ubatch;
+        const size_t ring_max = (size_t) cparams.n_ubatch + 1;
         for (int k = 0; k < n_rows; ++k) {
             while (mtp.h_ring.size() >= ring_max) {
                 mtp.h_ring.pop_front();
@@ -3443,6 +3554,8 @@ void llama_context::handle_mtp_for_ubatch(
             mtp.h_ring.push_back(std::move(e));
         }
     }
+
+    const int64_t t_after_copy_ring = ggml_time_us();
 
     // ---- Step 2: inspect MTP cache state ----
     llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(mtp.ctx_mtp), 0);
@@ -3456,6 +3569,7 @@ void llama_context::handle_mtp_for_ubatch(
         pos_max_mtp = need_pos;
     }
 
+    bool did_wipe = false;
     if (pos_max_mtp >= 0 && pos_max_mtp != need_pos) {
         // Gap: MTP cache ends somewhere other than need_pos.
         // Wipe and fall through to partial write.
@@ -3464,7 +3578,10 @@ void llama_context::handle_mtp_for_ubatch(
                        "drafts will degrade until cache repopulates\n",
                        __func__, (int) pos_max_mtp, (int) pos_start);
         pos_max_mtp = -1;
+        did_wipe = true;
     }
+
+    const int64_t t_after_reconcile = ggml_time_us();
 
     // ---- Step 4: find h_{need_pos} in the ring ----
     const float * h_prev = nullptr;
@@ -3483,13 +3600,17 @@ void llama_context::handle_mtp_for_ubatch(
                            "drafts will degrade until cache repopulates\n",
                            __func__, (int) need_pos);
             pos_max_mtp = -1;
+            did_wipe = true;
         }
     }
+
+    const int64_t t_after_lookup = ggml_time_us();
 
     // ---- Step 5: write hook batch ----
     const bool have_prev_h = (h_prev != nullptr);
     const int  n_out       = (have_prev_h ? 1 : 0) + (n_rows - 1);
 
+    int64_t t_decode = 0;
     if (n_out > 0) {
         int out_idx = 0;
         if (have_prev_h) {
@@ -3517,7 +3638,13 @@ void llama_context::handle_mtp_for_ubatch(
         GGML_ASSERT(out_idx == n_out);
         mtp.hook_batch.n_tokens = n_out;
 
+        const int64_t t_before_decode = ggml_time_us();
+
         const int32_t rc_dec = llama_decode(mtp.ctx_mtp, mtp.hook_batch);
+
+        const int64_t t_after_decode = ggml_time_us();
+        t_decode = t_after_decode - t_before_decode;
+
         if (rc_dec != 0) {
             // Decode failure leaves MTP cache in unknown state.
             // Clear the ring so the next call starts from scratch.
@@ -3527,6 +3654,23 @@ void llama_context::handle_mtp_for_ubatch(
             return;
         }
     }
+
+    const int64_t t_total = ggml_time_us() - t_start;
+
+    // Accumulate timing
+    mtp.hook_timing.t_total_us       += t_total;
+    mtp.hook_timing.t_sync_us        += t_after_sync - t_start;
+    mtp.hook_timing.t_copy_ring_us   += t_after_copy_ring - t_after_sync;
+    mtp.hook_timing.t_reconcile_us   += t_after_reconcile - t_after_copy_ring;
+    mtp.hook_timing.t_lookup_us      += t_after_lookup - t_after_reconcile;
+    mtp.hook_timing.t_build_batch_us += (t_total - t_decode - (t_after_lookup - t_start));
+    mtp.hook_timing.t_decode_us      += t_decode;
+    mtp.hook_timing.n_calls          += 1;
+    mtp.hook_timing.n_rows_copied    += n_rows;
+    mtp.hook_timing.n_rows_decoded   += n_out;
+    mtp.hook_timing.n_ring_misses    += (h_prev ? 0 : 1);
+    mtp.hook_timing.n_ring_hits      += (h_prev ? 1 : 0);
+    mtp.hook_timing.n_cache_wipes    += (did_wipe ? 1 : 0);
 }
 
 void llama_synchronize(llama_context * ctx) {

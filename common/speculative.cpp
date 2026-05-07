@@ -606,11 +606,19 @@ struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_mtp = nullptr;
 
     llama_batch       batch;       // single token draft step
-    common_sampler  * smpl = nullptr;
-    int32_t           n_embd = 0;
+    int32_t           n_embd  = 0;
+    int32_t           n_vocab = 0;
 
     uint16_t last_n_drafted  = 0;
     int32_t  last_n_accepted = -1;
+
+    // per-draft-call timing for optimization profiling
+    int64_t t_draft_total_us  = 0; // total draft() wall time
+    int64_t t_draft_copy_us   = 0; // copying h from trunk/mtp context
+    int64_t t_draft_decode_us = 0; // llama_decode on MTP ctx
+    int64_t t_draft_sample_us = 0; // sampling time
+    int32_t n_draft_steps     = 0; // total AR steps taken
+    int32_t n_draft_calls     = 0; // number of draft() invocations
 
     common_speculative_state_mtp(enum common_speculative_type type,
                                  llama_context * ctx_tgt,
@@ -618,15 +626,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
         : common_speculative_state(type), ctx_tgt(ctx_tgt), ctx_mtp(ctx_mtp) {
         GGML_ASSERT(ctx_tgt && ctx_mtp);
         const llama_model * model_mtp = llama_get_model(ctx_mtp);
-        n_embd = llama_model_n_embd(model_mtp);
-
-        {
-            common_params_sampling sparams;
-            sparams.no_perf  = false;
-            sparams.top_k    = 1;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-            smpl = common_sampler_init(model_mtp, sparams);
-        }
+        n_embd  = llama_model_n_embd(model_mtp);
+        n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_mtp));
 
         // TODO: multiple seq support
         batch = llama_batch_init(/*n_tokens=*/ 1, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
@@ -642,7 +643,6 @@ struct common_speculative_state_mtp : public common_speculative_state {
     ~common_speculative_state_mtp() override {
         llama_set_mtp(ctx_tgt, nullptr);
         llama_batch_free(batch);
-        common_sampler_free(smpl);
         if (ctx_mtp) {
             llama_free(ctx_mtp);
         }
@@ -694,6 +694,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
         llama_token cond_tok = id_last;
         llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0) + 1;
 
+        const int64_t t_draft_start = ggml_time_us();
+
         // auto-regressive loop for MTP
         for (int32_t k = 0; k < n_max; ++k) {
             ggml_tensor * src;
@@ -718,24 +720,48 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 LOG_WRN("%s: missing source tensor at k=%d; stopping chain\n", __func__, k);
                 return;
             }
+
+            const int64_t t_before_copy = ggml_time_us();
             ggml_backend_tensor_get(src, batch.embd,
                                     (size_t) src_row * row_bytes, row_bytes);
+            const int64_t t_after_copy = ggml_time_us();
 
             batch.token[0] = cond_tok;
             batch.pos[0]   = pos;
 
+            const int64_t t_before_decode = ggml_time_us();
             const int32_t dec_rc = llama_decode(ctx_mtp, batch);
+            const int64_t t_after_decode = ggml_time_us();
+
             if (dec_rc != 0) {
                 LOG_DBG("%s: llama_decode rc=%d at k=%d; stopping chain\n", __func__, dec_rc, k);
                 return;
             }
 
-            const llama_token best = common_sampler_sample(smpl, ctx_mtp, 0);
-            common_sampler_accept(smpl, best, /*accept_grammar=*/ false);
+            const int64_t t_before_sample = ggml_time_us();
+            float * logits = llama_get_logits_ith(ctx_mtp, 0);
+            llama_token best = 0;
+            float best_logit = logits[0];
+            for (int32_t vi = 1; vi < n_vocab; ++vi) {
+                if (logits[vi] > best_logit) {
+                    best_logit = logits[vi];
+                    best = vi;
+                }
+            }
+            const int64_t t_after_sample = ggml_time_us();
+
             draft_tokens.push_back(best);
             cond_tok = best;
             ++pos;
+
+            t_draft_copy_us   += (t_after_copy   - t_before_copy);
+            t_draft_decode_us += (t_after_decode  - t_before_decode);
+            t_draft_sample_us += (t_after_sample  - t_before_sample);
+            n_draft_steps     += 1;
         }
+
+        t_draft_total_us += (ggml_time_us() - t_draft_start);
+        n_draft_calls    += 1;
 
         last_n_drafted = (uint16_t) draft_tokens.size();
     }
@@ -1433,5 +1459,31 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
                 str_perf.c_str());
+
+        // MTP-specific draft timing
+        if (impl->type == COMMON_SPECULATIVE_TYPE_MTP) {
+            auto * mtp_impl = static_cast<common_speculative_state_mtp *>(impl.get());
+            if (mtp_impl->n_draft_calls > 0) {
+                LOG_INF("  MTP draft steps: %d calls, %d steps, avg %.1f drafts/call\n",
+                        mtp_impl->n_draft_calls, mtp_impl->n_draft_steps,
+                        (double) mtp_impl->n_draft_steps / mtp_impl->n_draft_calls);
+                LOG_INF("  MTP draft timing: total=%.2f ms (avg %.3f ms/call, %.3f ms/step)\n",
+                        mtp_impl->t_draft_total_us / 1000.0,
+                        mtp_impl->t_draft_total_us / 1000.0 / mtp_impl->n_draft_calls,
+                        mtp_impl->t_draft_total_us / 1000.0 / mtp_impl->n_draft_steps);
+                LOG_INF("    copy:  %.2f ms (%.1f%%) — %.3f ms/step\n",
+                        mtp_impl->t_draft_copy_us / 1000.0,
+                        100.0 * mtp_impl->t_draft_copy_us / std::max<int64_t>(1, mtp_impl->t_draft_total_us),
+                        mtp_impl->t_draft_copy_us / 1000.0 / mtp_impl->n_draft_steps);
+                LOG_INF("    decode:%.2f ms (%.1f%%) — %.3f ms/step\n",
+                        mtp_impl->t_draft_decode_us / 1000.0,
+                        100.0 * mtp_impl->t_draft_decode_us / std::max<int64_t>(1, mtp_impl->t_draft_total_us),
+                        mtp_impl->t_draft_decode_us / 1000.0 / mtp_impl->n_draft_steps);
+                LOG_INF("    sample:%.2f ms (%.1f%%) — %.3f ms/step\n",
+                        mtp_impl->t_draft_sample_us / 1000.0,
+                        100.0 * mtp_impl->t_draft_sample_us / std::max<int64_t>(1, mtp_impl->t_draft_total_us),
+                        mtp_impl->t_draft_sample_us / 1000.0 / mtp_impl->n_draft_steps);
+            }
+        }
     }
 }

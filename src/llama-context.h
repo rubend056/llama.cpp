@@ -91,6 +91,12 @@ struct llama_context {
     void            set_mtp(llama_context * ctx_mtp_in);
     llama_context * get_mtp() const { return mtp.ctx_mtp; }
 
+    const mtp_hook_timing & get_mtp_hook_timing() const { return mtp.hook_timing; }
+    void                    reset_mtp_timing()           { mtp.hook_timing.reset(); }
+
+    const trunk_dec_timing & get_trunk_timing() const { return trunk_timing; }
+    void                     reset_trunk_timing()      { trunk_timing.reset(); }
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -283,6 +289,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_mtp mtp;
+
+    trunk_dec_timing trunk_timing;
 
     std::unique_ptr<llama_memory_i> memory;
 

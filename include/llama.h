@@ -979,6 +979,14 @@ extern "C" {
             struct llama_context * ctx_target,
             struct llama_context * ctx_mtp);
 
+    // Print and reset MTP hook timing statistics
+    LLAMA_API void llama_mtp_timing_log (struct llama_context * ctx);
+    LLAMA_API void llama_mtp_timing_reset(struct llama_context * ctx);
+
+    // Print and reset trunk (main model) decode timing statistics
+    LLAMA_API void llama_trunk_timing_log (struct llama_context * ctx);
+    LLAMA_API void llama_trunk_timing_reset(struct llama_context * ctx);
+
     LLAMA_API bool llama_context_seq_rm(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
