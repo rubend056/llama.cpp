@@ -3585,7 +3585,7 @@ void llama_context::handle_mtp_for_ubatch(
 
     // ---- Step 4: find h_{need_pos} in the ring ----
     const float * h_prev = nullptr;
-    if (pos_max_mtp == need_pos) {
+    if (pos_max_mtp >= 0 && pos_max_mtp == need_pos) {
         for (auto it = mtp.h_ring.rbegin(); it != mtp.h_ring.rend(); ++it) {
             if (it->pos == need_pos) {
                 h_prev = it->h.data();
@@ -3594,13 +3594,11 @@ void llama_context::handle_mtp_for_ubatch(
         }
         if (!h_prev) {
             // Ring doesn't have the needed h-row — it fell out or is from
-            // a stale sequence. Wipe MTP cache and recover via partial write.
-            llama_memory_seq_rm(llama_get_memory(mtp.ctx_mtp), 0, -1, -1);
-            LLAMA_LOG_WARN("%s: MTP cache wiped — h_{%d} not in ring; "
-                           "drafts will degrade until cache repopulates\n",
-                           __func__, (int) need_pos);
-            pos_max_mtp = -1;
-            did_wipe = true;
+            // a stale sequence.  We still have valid KV-cache pages up to
+            // need_pos (mirrored from the trunk), so don't wipe; just skip
+            // the h_prev prepend.  The 1-position gap at pos_start is
+            // harmless — the next ubatch's ring lookup will find h_{pos_start}
+            // and the gap closes naturally.
         }
     }
 
